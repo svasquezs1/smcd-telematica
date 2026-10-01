@@ -1,341 +1,587 @@
 /*
  * Servidor central del sistema SMCD (Sistema de Monitoreo y Control Distribuido)
- * Fase 2 — Implementación de comunicación básica.
+ * Fase 3 — Concurrencia, resiliencia y pruebas.
  *
- * Alcance de esta fase (ver Fase de Desarrollo en la wiki):
- *   - Sockets TCP (registro de nodos, eventos, autenticación, consultas)
- *   - Socket UDP (telemetría periódica)
- *   - Multiplexado con select() para no bloquearse en un solo cliente
- *   - Reglas básicas del protocolo NMP (secuencia REG_REQ antes de EVENT_REQ, etc.)
+ * Uso:   ./servidor <puerto> <archivoDeLogs>
  *
- * Explícitamente FUERA de alcance en esta fase (se implementa en Fase 3):
- *   - Concurrencia real con hilos (pthread) y mutex
- *   - Autenticación real contra LDAP (aquí hay un placeholder documentado)
+ * Variables de entorno opcionales (ver README):
+ *   SMCD_TIMEOUT_NODO    segundos sin telemetria para marcar un nodo INACTIVO (15)
+ *   SMCD_MAX_CONEXIONES  maximo de conexiones TCP simultaneas (200)
+ *   SMCD_LDAP_URI, SMCD_LDAP_BASE   servicio de autenticacion (ver auth_ldap.c)
  *
- * Uso:
- *   ./servidor <puerto> <archivoDeLogs>
+ * ARQUITECTURA DE HILOS (ver Bloque 4):
+ *   - hilo principal : accept() de conexiones TCP; por cada una crea un hilo.
+ *   - hilo UDP       : recibe la telemetria de todos los nodos.
+ *   - hilo monitor   : cada segundo detecta nodos que dejaron de reportar.
+ *   - un hilo por cada conexion TCP (nodo o cliente de administracion).
+ * Toda la informacion compartida vive en estado.c, protegida con un mutex.
  */
-
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
-#include <time.h>
 #include <errno.h>
 #include <signal.h>
+#include <pthread.h>
 #include <arpa/inet.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <sys/select.h>
+#include <sys/socket.h>
+#include <sys/time.h>
 #include "protocolo.h"
+#include "estado.h"
+#include "auth.h"
+#include "log.h"
 
-#define MAX_NODOS 50
-#define MAX_CLIENTES_TCP 10
+/* ---------------------------------------------------------------------- */
+/* Parametros y temporizadores                                            */
+/* ---------------------------------------------------------------------- */
+#define TIMEOUT_RECV_S          10    /* granularidad de las lecturas TCP           */
+#define TIMEOUT_HANDSHAKE_S     10    /* tiempo para identificarse (REG/AUTH)       */
+#define TIMEOUT_CLIENTE_IDLE_S  300   /* un cliente de admin inactivo se desconecta */
+#define MAX_ERRORES_SEGUIDOS    5     /* errores consecutivos antes de cerrar       */
+#define MAX_INTENTOS_AUTH       3     /* intentos de autenticacion por conexion     */
+#define STACK_HILO              (1024 * 1024)
+
+static int g_timeout_nodo   = 15;
+static int g_max_conexiones = 200;
+
+static volatile sig_atomic_t g_running = 1;
+static int g_conexiones = 0;
+static pthread_mutex_t g_conn_mtx = PTHREAD_MUTEX_INITIALIZER;
+
+/* ---------------------------------------------------------------------- */
+/* Sesion: estado de UNA conexion TCP (cada hilo tiene la suya)           */
+/* ---------------------------------------------------------------------- */
+typedef enum { S_NUEVA, S_NODO, S_CLIENTE } sesion_tipo_t;
 
 typedef struct {
-    char   id[NMP_MAX_FROM];
-    char   ip[INET_ADDRSTRLEN];
-    int    puerto;
-    int    registrado;
-    time_t ultima_actividad;
-    char   ultima_telemetria[256];
-    int    num_eventos;
-} nodo_t;
+    int           fd;
+    char          ip[INET_ADDRSTRLEN];
+    int           puerto;
+    sesion_tipo_t tipo;                 /* maquina de estados de la conexion   */
+    char          id[NMP_MAX_FROM];     /* id del nodo o nombre del usuario    */
+    char          perfil[16];           /* "admin" / "viewer" (solo clientes)  */
+    char          token[17];            /* identificador de sesion (clientes)  */
+    unsigned long sesion_nodo;          /* sesion registrada en estado.c       */
+    int           errores_seguidos;
+    int           intentos_auth;
+} sesion_t;
 
-static nodo_t nodos[MAX_NODOS];
-static int num_nodos = 0;
-static FILE *log_file = NULL;
+typedef struct { int fd; char ip[INET_ADDRSTRLEN]; int puerto; } conn_t;
 
 /* ---------------------------------------------------------------------- */
-/* Logging: a consola y a archivo, con timestamp e IP:puerto del origen,   */
-/* tal como lo exige el enunciado del proyecto.                            */
+/* Envio de respuestas con logging                                        */
 /* ---------------------------------------------------------------------- */
-static void log_evento(const char *nivel, const char *ip, int puerto, const char *detalle) {
-    time_t now = time(NULL);
-    struct tm *t = localtime(&now);
-    char timestamp[32];
-    strftime(timestamp, sizeof(timestamp), "%Y-%m-%d %H:%M:%S", t);
+static int enviar(sesion_t *s, int type, int id, const char *payload) {
+    char vista[256];
+    log_sanear(payload, vista, sizeof(vista));
+    log_evento(type == TYPE_ERROR ? "WARNING" : "INFO", s->ip, s->puerto,
+               "--> %s id=%d \"%s\"", nmp_type_name(type), id, vista);
+    return nmp_send(s->fd, type, id, "servidor", payload) == NMP_OK ? 0 : -1;
+}
 
-    printf("[%s] [%s] [%s:%d] %s\n", timestamp, nivel, ip, puerto, detalle);
+static int enviar_error(sesion_t *s, int id, const char *codigo, const char *detalle) {
+    char p[160];
+    snprintf(p, sizeof(p), "codigo=%s;detalle=%s", codigo, detalle);
+    return enviar(s, TYPE_ERROR, id, p);
+}
 
-    if (log_file) {
-        fprintf(log_file, "[%s] [%s] [%s:%d] %s\n", timestamp, nivel, ip, puerto, detalle);
-        fflush(log_file);
+/* Rechaza un mensaje con ERROR y cuenta el error. Devuelve 1 si hay que cerrar
+ * la conexion (fallo al enviar o demasiados errores seguidos). */
+static int rechazar(sesion_t *s, int id, const char *codigo, const char *detalle) {
+    if (enviar_error(s, id, codigo, detalle) < 0) return 1;
+    if (++s->errores_seguidos >= MAX_ERRORES_SEGUIDOS) {
+        log_evento("WARNING", s->ip, s->puerto,
+                   "Demasiados errores seguidos (%d): se cierra la conexion", s->errores_seguidos);
+        return 1;
     }
+    return 0;
 }
 
 /* ---------------------------------------------------------------------- */
-/* Tabla de estado de nodos (en memoria, sin protección con mutex todavía  */
-/* porque en esta fase el servidor es de un solo hilo — ver Bloque 4).     */
+/* Utilidades                                                             */
 /* ---------------------------------------------------------------------- */
-static nodo_t *buscar_nodo(const char *id) {
-    for (int i = 0; i < num_nodos; i++) {
-        if (strcmp(nodos[i].id, id) == 0) return &nodos[i];
+static int env_int(const char *nombre, int defecto, int min, int max) {
+    const char *v = getenv(nombre);
+    if (!v || !*v) return defecto;
+    char *fin;
+    long n = strtol(v, &fin, 10);
+    if (*fin != '\0' || n < min || n > max) {
+        fprintf(stderr, "Aviso: %s=%s invalido, se usa %d\n", nombre, v, defecto);
+        return defecto;
+    }
+    return (int) n;
+}
+
+/* Token de sesion aleatorio (16 hex) leido de /dev/urandom. 0 si ok. */
+static int generar_token(char *out) {
+    unsigned char b[8];
+    FILE *f = fopen("/dev/urandom", "rb");
+    if (!f) return -1;
+    size_t n = fread(b, 1, sizeof(b), f);
+    fclose(f);
+    if (n != sizeof(b)) return -1;
+    for (int i = 0; i < 8; i++) sprintf(out + 2 * i, "%02x", b[i]);
+    return 0;
+}
+
+static int tipo_nodo_valido(const char *t) {
+    return strcmp(t, "iot") == 0 || strcmp(t, "red") == 0 || strcmp(t, "servidor") == 0;
+}
+
+/* ---------------------------------------------------------------------- */
+/* Manejadores de cada primitiva del protocolo NMP                        */
+/* Devuelven 1 si la conexion debe cerrarse, 0 si debe continuar.         */
+/* ---------------------------------------------------------------------- */
+
+/* REG_REQ: un nodo se registra. Payload: tipo=<iot|red|servidor> */
+static int h_reg(sesion_t *s, const nmp_message_t *m) {
+    char tipo[16];
+    if (nmp_get_field(m->payload, "tipo", tipo, sizeof(tipo)) < 0 || !tipo_nodo_valido(tipo))
+        return rechazar(s, m->id, "PARAMETRO_INVALIDO", "tipo_requerido_iot_red_servidor");
+
+    unsigned long sesion;
+    int reemplazo;
+    int rc = estado_registrar_nodo(m->from, tipo, s->ip, s->puerto, &sesion, &reemplazo);
+    if (rc == EST_LLENO) {
+        enviar_error(s, m->id, "TABLA_LLENA", "no_caben_mas_nodos");
+        return 1;
+    }
+    if (reemplazo)
+        log_evento("WARNING", s->ip, s->puerto,
+                   "Nodo %s ya estaba conectado: la nueva conexion reemplaza a la anterior", m->from);
+
+    s->tipo = S_NODO;
+    snprintf(s->id, sizeof(s->id), "%s", m->from);
+    s->sesion_nodo = sesion;
+    s->errores_seguidos = 0;
+
+    char p[64];
+    snprintf(p, sizeof(p), "resultado=ok;sesion=%lu", sesion);
+    log_evento("INFO", s->ip, s->puerto, "Nodo %s registrado (tipo=%s)", m->from, tipo);
+    return enviar(s, TYPE_REG_ACK, m->id, p) < 0;
+}
+
+/* EVENT_REQ: evento critico de un nodo ya registrado. Payload: tipo=... */
+static int h_event(sesion_t *s, const nmp_message_t *m) {
+    char tipo[48];
+    if (m->len >= MAX_DATOS || nmp_get_field(m->payload, "tipo", tipo, sizeof(tipo)) < 0)
+        return rechazar(s, m->id, "PARAMETRO_INVALIDO", "evento_requiere_campo_tipo_y_menos_de_256_bytes");
+
+    int rc = estado_evento(s->id, m->id, m->payload);
+    if (rc == EST_NO_REGISTRADO) {
+        enviar_error(s, m->id, "NO_REGISTRADO", "sesion_de_nodo_ya_no_es_valida");
+        return 1;
+    }
+    s->errores_seguidos = 0;
+    if (rc == EST_DUPLICADO) {
+        log_evento("WARNING", s->ip, s->puerto,
+                   "EVENT_REQ duplicado de %s (id=%d): se confirma de nuevo sin guardarlo otra vez",
+                   s->id, m->id);
+        return enviar(s, TYPE_EVENT_ACK, m->id, "resultado=ok;duplicado=1") < 0;
+    }
+    char vista[256];
+    log_sanear(m->payload, vista, sizeof(vista));
+    log_evento("WARNING", s->ip, s->puerto, "EVENTO CRITICO de %s: %s", s->id, vista);
+    return enviar(s, TYPE_EVENT_ACK, m->id, "resultado=ok") < 0;
+}
+
+/* AUTH_REQ: un cliente de administracion se autentica contra LDAP.
+ * Payload: usuario=<u>;password=<p>   (valores codificados con %XX) */
+static int h_auth(sesion_t *s, const nmp_message_t *m) {
+    char usuario[64], password[256];
+    if (nmp_get_field(m->payload, "usuario", usuario, sizeof(usuario)) < 0 ||
+        nmp_get_field(m->payload, "password", password, sizeof(password)) < 0)
+        return rechazar(s, m->id, "PARAMETRO_INVALIDO", "se_requiere_usuario_y_password");
+    if (strcmp(usuario, m->from) != 0)
+        return rechazar(s, m->id, "IDENTIDAD_INVALIDA", "FROM_debe_coincidir_con_usuario");
+
+    char perfil[16];
+    int rc = auth_validar(usuario, password, perfil, sizeof(perfil));
+    memset(password, 0, sizeof(password));   /* no dejamos la clave en memoria */
+
+    if (rc == AUTH_SERVICIO_NO_DISPONIBLE) {
+        log_evento("ERROR", s->ip, s->puerto, "Servicio de autenticacion no disponible");
+        return enviar_error(s, m->id, "SERVICIO_AUTH_NO_DISPONIBLE", "intente_mas_tarde") < 0;
+    }
+    if (rc != AUTH_OK) {
+        s->intentos_auth++;
+        log_evento("WARNING", s->ip, s->puerto, "Autenticacion RECHAZADA para '%s' (intento %d/%d)",
+                   usuario, s->intentos_auth, MAX_INTENTOS_AUTH);
+        if (enviar(s, TYPE_AUTH_ACK, m->id, "resultado=rechazo;motivo=credenciales_invalidas") < 0) return 1;
+        if (s->intentos_auth >= MAX_INTENTOS_AUTH) {
+            log_evento("WARNING", s->ip, s->puerto, "Maximo de intentos de autenticacion: se cierra");
+            return 1;
+        }
+        return 0;
+    }
+    if (generar_token(s->token) < 0) {
+        enviar_error(s, m->id, "ERROR_INTERNO", "no_se_pudo_crear_la_sesion");
+        return 1;
+    }
+    s->tipo = S_CLIENTE;
+    snprintf(s->id, sizeof(s->id), "%s", usuario);
+    snprintf(s->perfil, sizeof(s->perfil), "%s", perfil);
+    s->errores_seguidos = 0;
+
+    char p[96];
+    snprintf(p, sizeof(p), "resultado=ok;perfil=%s;sesion=%s", perfil, s->token);
+    log_evento("INFO", s->ip, s->puerto, "Usuario '%s' autenticado (perfil=%s)", usuario, perfil);
+    return enviar(s, TYPE_AUTH_ACK, m->id, p) < 0;
+}
+
+/* QUERY_REQ: consulta de un cliente autenticado.
+ * Payload: sesion=<token>;consulta=<estado|historial|eventos>[;nodo=<id>][;n=<1..10>]
+ * Perfiles: viewer -> estado, historial.   admin -> ademas eventos. */
+static int h_query(sesion_t *s, const nmp_message_t *m) {
+    char sesion[32], consulta[16];
+    if (nmp_get_field(m->payload, "sesion", sesion, sizeof(sesion)) < 0 ||
+        strcmp(sesion, s->token) != 0)
+        return rechazar(s, m->id, "SESION_INVALIDA", "token_de_sesion_incorrecto");
+    if (nmp_get_field(m->payload, "consulta", consulta, sizeof(consulta)) < 0)
+        return rechazar(s, m->id, "PARAMETRO_INVALIDO", "falta_el_campo_consulta");
+
+    static const size_t CAP = NMP_MAX_PAYLOAD - 160;
+    char cuerpo[NMP_MAX_PAYLOAD - 160];
+    char resp[NMP_MAX_PAYLOAD];
+    int registros;
+
+    if (strcmp(consulta, "estado") == 0) {
+        registros = estado_listar(cuerpo, CAP);
+    } else if (strcmp(consulta, "historial") == 0) {
+        char nodo[NMP_MAX_FROM], nstr[8];
+        int n = MAX_HIST;
+        if (nmp_get_field(m->payload, "nodo", nodo, sizeof(nodo)) < 0 || !nmp_id_valido(nodo))
+            return rechazar(s, m->id, "PARAMETRO_INVALIDO", "historial_requiere_nodo");
+        if (nmp_get_field(m->payload, "n", nstr, sizeof(nstr)) == 0) {
+            char *fin;
+            long v = strtol(nstr, &fin, 10);
+            if (*nstr == '\0' || *fin != '\0' || v < 1 || v > MAX_HIST)
+                return rechazar(s, m->id, "PARAMETRO_INVALIDO", "n_debe_estar_entre_1_y_10");
+            n = (int) v;
+        }
+        registros = estado_historial(nodo, n, cuerpo, CAP);
+        if (registros < 0)
+            return rechazar(s, m->id, "NODO_DESCONOCIDO", "el_nodo_no_existe");
+    } else if (strcmp(consulta, "eventos") == 0) {
+        if (strcmp(s->perfil, "admin") != 0) {
+            log_evento("WARNING", s->ip, s->puerto,
+                       "ACCESO DENEGADO: '%s' (perfil %s) pidio la consulta 'eventos'", s->id, s->perfil);
+            return rechazar(s, m->id, "ACCESO_DENEGADO", "la_consulta_eventos_requiere_perfil_admin");
+        }
+        registros = estado_eventos(cuerpo, CAP);
+    } else {
+        return rechazar(s, m->id, "PARAMETRO_INVALIDO", "consulta_desconocida");
+    }
+
+    s->errores_seguidos = 0;
+    snprintf(resp, sizeof(resp), "resultado=ok;consulta=%s;registros=%d\n%s", consulta, registros, cuerpo);
+    return enviar(s, TYPE_QUERY_RESP, m->id, resp) < 0;
+}
+
+/* ---------------------------------------------------------------------- */
+/* Despacho: aplica la maquina de estados de la conexion (ver wiki)       */
+/* ---------------------------------------------------------------------- */
+static int procesar(sesion_t *s, const nmp_message_t *m) {
+    if (m->type < TYPE_REG_REQ || m->type > TYPE_ERROR)
+        return rechazar(s, m->id, "TIPO_DESCONOCIDO", "tipo_de_mensaje_no_definido");
+    if (!nmp_payload_valido(m->payload))
+        return rechazar(s, m->id, "PARAMETRO_INVALIDO", "payload_mal_formado");
+    if (s->tipo != S_NUEVA && strcmp(m->from, s->id) != 0)
+        return rechazar(s, m->id, "IDENTIDAD_INVALIDA", "FROM_no_coincide_con_la_sesion");
+
+    switch (s->tipo) {
+    case S_NUEVA:
+        if (m->type == TYPE_REG_REQ)   return h_reg(s, m);
+        if (m->type == TYPE_AUTH_REQ)  return h_auth(s, m);
+        if (m->type == TYPE_EVENT_REQ) return rechazar(s, m->id, "NO_REGISTRADO", "registrese_primero_con_REG_REQ");
+        if (m->type == TYPE_QUERY_REQ) return rechazar(s, m->id, "NO_AUTENTICADO", "autentiquese_primero_con_AUTH_REQ");
+        break;
+    case S_NODO:
+        if (m->type == TYPE_EVENT_REQ) return h_event(s, m);
+        if (m->type == TYPE_REG_REQ)   return rechazar(s, m->id, "FUERA_DE_SECUENCIA", "el_nodo_ya_esta_registrado");
+        break;
+    case S_CLIENTE:
+        if (m->type == TYPE_QUERY_REQ) return h_query(s, m);
+        if (m->type == TYPE_AUTH_REQ)  return rechazar(s, m->id, "FUERA_DE_SECUENCIA", "el_cliente_ya_esta_autenticado");
+        break;
+    }
+    if (m->type == TYPE_TELEMETRY)
+        return rechazar(s, m->id, "FUERA_DE_SECUENCIA", "la_telemetria_solo_se_envia_por_UDP");
+    return rechazar(s, m->id, "FUERA_DE_SECUENCIA", "mensaje_no_valido_en_este_estado");
+}
+
+/* ---------------------------------------------------------------------- */
+/* Hilo de una conexion TCP                                               */
+/* ---------------------------------------------------------------------- */
+static void configurar_socket_tcp(int fd) {
+    struct timeval rcv = { TIMEOUT_RECV_S, 0 }, snd = { 5, 0 };
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &rcv, sizeof(rcv));
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &snd, sizeof(snd));
+    /* Keepalive: detecta pares muertos (cable desconectado, maquina caida)
+     * en conexiones largas que pasan mucho rato sin enviar nada. */
+    int on = 1, idle = 30, intvl = 10, cnt = 3;
+    setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &on, sizeof(on));
+    setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &idle, sizeof(idle));
+    setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &intvl, sizeof(intvl));
+    setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &cnt, sizeof(cnt));
+}
+
+static void *hilo_conexion(void *arg) {
+    conn_t *c = (conn_t *) arg;
+    sesion_t s;
+    memset(&s, 0, sizeof(s));
+    s.fd = c->fd;
+    s.puerto = c->puerto;
+    snprintf(s.ip, sizeof(s.ip), "%s", c->ip);
+    s.tipo = S_NUEVA;
+    free(c);
+
+    configurar_socket_tcp(s.fd);
+    log_evento("INFO", s.ip, s.puerto, "Nueva conexion TCP aceptada");
+
+    int ocioso = 0;
+    while (g_running) {
+        nmp_message_t msg;
+        int rc = nmp_recv(s.fd, &msg);
+
+        if (rc == NMP_OK) {
+            ocioso = 0;
+            char vista[256];
+            log_sanear(msg.payload, vista, sizeof(vista));
+            log_evento("INFO", s.ip, s.puerto, "<-- %s id=%d from=%s \"%s\"",
+                       nmp_type_name(msg.type), msg.id, msg.from, vista);
+            if (procesar(&s, &msg)) break;
+            continue;
+        }
+        if (rc == NMP_ERR_TIMEOUT) {
+            ocioso += TIMEOUT_RECV_S;
+            if (s.tipo == S_NUEVA && ocioso >= TIMEOUT_HANDSHAKE_S) {
+                log_evento("WARNING", s.ip, s.puerto,
+                           "Timeout: la conexion no se identifico en %d s", TIMEOUT_HANDSHAKE_S);
+                enviar_error(&s, 0, "TIMEOUT", "no_se_identifico_a_tiempo");
+                break;
+            }
+            if (s.tipo == S_CLIENTE && ocioso >= TIMEOUT_CLIENTE_IDLE_S) {
+                log_evento("INFO", s.ip, s.puerto, "Cliente '%s' inactivo %d s: se desconecta", s.id, ocioso);
+                break;
+            }
+            continue;   /* un nodo puede pasar mucho rato sin enviar por TCP */
+        }
+        if (rc == NMP_ERR_FORMATO) {
+            /* Tras un error de formato el flujo TCP queda desincronizado:
+             * respondemos ERROR y cerramos esta conexion (no el servidor). */
+            log_evento("WARNING", s.ip, s.puerto, "Mensaje con formato invalido: se cierra la conexion");
+            enviar_error(&s, 0, "FORMATO_INVALIDO", "cabecera_o_LEN_incorrectos");
+            break;
+        }
+        break;   /* NMP_ERR_CERRADA: el otro extremo se fue */
+    }
+
+    if (s.tipo == S_NODO) estado_nodo_desconectado(s.id, s.sesion_nodo);
+    if (s.tipo == S_NUEVA)
+        log_evento("INFO", s.ip, s.puerto, "Conexion TCP cerrada");
+    else
+        log_evento("INFO", s.ip, s.puerto, "Conexion TCP cerrada (%s %s)",
+                   s.tipo == S_NODO ? "nodo" : "usuario", s.id);
+    close(s.fd);
+
+    pthread_mutex_lock(&g_conn_mtx);
+    g_conexiones--;
+    pthread_mutex_unlock(&g_conn_mtx);
+    return NULL;
+}
+
+/* ---------------------------------------------------------------------- */
+/* Hilo UDP: telemetria (fire-and-forget, nunca se responde)              */
+/* ---------------------------------------------------------------------- */
+static void *hilo_udp(void *arg) {
+    int fd = *(int *) arg;
+    char buf[2048];
+
+    while (g_running) {
+        struct sockaddr_in rem;
+        socklen_t rl = sizeof(rem);
+        ssize_t n = recvfrom(fd, buf, sizeof(buf), 0, (struct sockaddr *) &rem, &rl);
+        if (n < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) continue;
+            log_evento("ERROR", "-", 0, "recvfrom UDP fallo: %s", strerror(errno));
+            usleep(100000);
+            continue;
+        }
+        char ip[INET_ADDRSTRLEN];
+        inet_ntop(AF_INET, &rem.sin_addr, ip, sizeof(ip));
+        int puerto = ntohs(rem.sin_port);
+
+        nmp_message_t msg;
+        if (nmp_parse_buffer(buf, (int) n, &msg) != NMP_OK) {
+            log_evento("WARNING", ip, puerto, "Datagrama UDP con formato invalido (%zd bytes): descartado", n);
+            continue;
+        }
+        char vista[256];
+        log_sanear(msg.payload, vista, sizeof(vista));
+        log_evento("INFO", ip, puerto, "<-- %s id=%d from=%s \"%s\"",
+                   nmp_type_name(msg.type), msg.id, msg.from, vista);
+
+        if (msg.type != TYPE_TELEMETRY) {
+            log_evento("WARNING", ip, puerto, "Tipo %s no esta permitido por UDP: descartado", nmp_type_name(msg.type));
+            continue;
+        }
+        if (msg.len == 0 || msg.len >= MAX_DATOS || !nmp_payload_valido(msg.payload)) {
+            log_evento("WARNING", ip, puerto, "TELEMETRY de %s con parametros invalidos: descartada", msg.from);
+            continue;
+        }
+
+        int recuperado;
+        int rc = estado_telemetria(msg.from, msg.id, msg.payload, ip, &recuperado);
+        switch (rc) {
+        case EST_OK:
+            if (recuperado) log_evento("INFO", ip, puerto, "Nodo %s RECUPERADO: volvio a reportar", msg.from);
+            break;
+        case EST_DUPLICADO:
+            log_evento("WARNING", ip, puerto, "TELEMETRY de %s repetida o desordenada (id=%d): descartada", msg.from, msg.id);
+            break;
+        case EST_ORIGEN_INVALIDO:
+            log_evento("WARNING", ip, puerto, "TELEMETRY de %s descartada: la IP no coincide con la del nodo registrado", msg.from);
+            break;
+        default:
+            log_evento("WARNING", ip, puerto, "TELEMETRY de %s descartada: nodo desconocido o no registrado", msg.from);
+        }
     }
     return NULL;
 }
 
-static nodo_t *buscar_o_crear_nodo(const char *id) {
-    nodo_t *existente = buscar_nodo(id);
-    if (existente) return existente;
-    if (num_nodos >= MAX_NODOS) return NULL;
-
-    nodo_t *n = &nodos[num_nodos++];
-    memset(n, 0, sizeof(nodo_t));
-    strncpy(n->id, id, sizeof(n->id) - 1);
-    return n;
-}
-
 /* ---------------------------------------------------------------------- */
-/* Manejo de mensajes TCP: aplica las reglas básicas de secuencia del      */
-/* protocolo NMP (ver especificación en la wiki).                          */
+/* Hilo monitor: detecta nodos que dejaron de reportar telemetria          */
 /* ---------------------------------------------------------------------- */
-static void manejar_mensaje_tcp(int fd, const char *ip, int puerto, nmp_message_t *msg) {
-    char detalle[256];
-
-    switch (msg->type) {
-
-        case TYPE_REG_REQ: {
-            nodo_t *n = buscar_o_crear_nodo(msg->from);
-            if (!n) {
-                nmp_send(fd, TYPE_ERROR, msg->id, "servidor", "tabla_de_nodos_llena");
-                snprintf(detalle, sizeof(detalle), "REG_REQ de %s -> ERROR(tabla_llena)", msg->from);
-                log_evento("ERROR", ip, puerto, detalle);
-                break;
-            }
-            n->registrado = 1;
-            strncpy(n->ip, ip, sizeof(n->ip) - 1);
-            n->puerto = puerto;
-            n->ultima_actividad = time(NULL);
-
-            nmp_send(fd, TYPE_REG_ACK, msg->id, "servidor", "ok");
-            snprintf(detalle, sizeof(detalle), "REG_REQ de %s -> REG_ACK(ok)", msg->from);
-            log_evento("INFO", ip, puerto, detalle);
-            break;
-        }
-
-        case TYPE_EVENT_REQ: {
-            nodo_t *n = buscar_nodo(msg->from);
-            if (!n || !n->registrado) {
-                /* Regla básica del protocolo: no se aceptan eventos de un
-                 * nodo que nunca completó su registro. */
-                nmp_send(fd, TYPE_ERROR, msg->id, "servidor", "nodo_no_registrado");
-                snprintf(detalle, sizeof(detalle), "EVENT_REQ de %s -> ERROR(nodo_no_registrado)", msg->from);
-                log_evento("ERROR", ip, puerto, detalle);
-                break;
-            }
-            n->num_eventos++;
-            n->ultima_actividad = time(NULL);
-
-            nmp_send(fd, TYPE_EVENT_ACK, msg->id, "servidor", "ok");
-            {
-                char detalle_grande[NMP_MAX_PAYLOAD + NMP_MAX_LINE];
-                snprintf(detalle_grande, sizeof(detalle_grande),
-                         "EVENT_REQ de %s (%s) -> EVENT_ACK(ok)", msg->from, msg->payload);
-                log_evento("INFO", ip, puerto, detalle_grande);
-            }
-            break;
-        }
-
-        case TYPE_AUTH_REQ: {
-            /* PLACEHOLDER de Fase 2: se acepta cualquier autenticación.
-             * La integración real contra LDAP (ldap_bind, ver Bloque 6 de
-             * la wiki) queda para la Fase 3. */
-            nmp_send(fd, TYPE_AUTH_ACK, msg->id, "servidor", "ok");
-            snprintf(detalle, sizeof(detalle),
-                     "AUTH_REQ de %s -> AUTH_ACK(ok) [placeholder, LDAP pendiente para Fase 3]", msg->from);
-            log_evento("INFO", ip, puerto, detalle);
-            break;
-        }
-
-        case TYPE_QUERY_REQ: {
-            char resultado[512] = "";
-            for (int i = 0; i < num_nodos; i++) {
-                char linea[350];
-                snprintf(linea, sizeof(linea), "%s:%s;", nodos[i].id,
-                         nodos[i].ultima_telemetria[0] ? nodos[i].ultima_telemetria : "sin_datos");
-                strncat(resultado, linea, sizeof(resultado) - strlen(resultado) - 1);
-            }
-            nmp_send(fd, TYPE_QUERY_RESP, msg->id, "servidor", resultado);
-            snprintf(detalle, sizeof(detalle), "QUERY_REQ de %s -> QUERY_RESP", msg->from);
-            log_evento("INFO", ip, puerto, detalle);
-            break;
-        }
-
-        default: {
-            nmp_send(fd, TYPE_ERROR, msg->id, "servidor", "tipo_de_mensaje_desconocido");
-            snprintf(detalle, sizeof(detalle), "TYPE=%d desconocido de %s", msg->type, msg->from);
-            log_evento("ERROR", ip, puerto, detalle);
-        }
+static void *hilo_monitor(void *arg) {
+    (void) arg;
+    while (g_running) {
+        sleep(1);
+        estado_revisar_inactividad(g_timeout_nodo);
     }
+    return NULL;
 }
 
 /* ---------------------------------------------------------------------- */
-/* Manejo de telemetría por UDP: no responde nada (fire-and-forget), solo  */
-/* actualiza la tabla de estado si el nodo ya está registrado.             */
-/* ---------------------------------------------------------------------- */
-static void manejar_telemetria_udp(const char *ip, int puerto, nmp_message_t *msg) {
-    char detalle[NMP_MAX_PAYLOAD + NMP_MAX_LINE];
-    nodo_t *n = buscar_nodo(msg->from);
+static void al_recibir_senal(int sig) { (void) sig; g_running = 0; }
 
-    if (!n || !n->registrado) {
-        snprintf(detalle, sizeof(detalle), "TELEMETRY de %s IGNORADA (nodo no registrado)", msg->from);
-        log_evento("WARNING", ip, puerto, detalle);
-        return;
-    }
-
-    strncpy(n->ultima_telemetria, msg->payload, sizeof(n->ultima_telemetria) - 1);
-    n->ultima_actividad = time(NULL);
-
-    snprintf(detalle, sizeof(detalle), "TELEMETRY de %s: %s", msg->from, msg->payload);
-    log_evento("INFO", ip, puerto, detalle);
-}
-
-/* ---------------------------------------------------------------------- */
 int main(int argc, char *argv[]) {
     if (argc != 3) {
         fprintf(stderr, "Uso: %s <puerto> <archivoDeLogs>\n", argv[0]);
         return 1;
     }
-
-    int puerto = atoi(argv[1]);
-    log_file = fopen(argv[2], "a");
-    if (!log_file) {
+    char *fin;
+    long puerto = strtol(argv[1], &fin, 10);
+    if (*argv[1] == '\0' || *fin != '\0' || puerto < 1 || puerto > 65535) {
+        fprintf(stderr, "Puerto invalido: %s (debe estar entre 1 y 65535)\n", argv[1]);
+        return 1;
+    }
+    if (log_iniciar(argv[2]) < 0) {
         perror("No se pudo abrir el archivo de logs");
         return 1;
     }
+    g_timeout_nodo   = env_int("SMCD_TIMEOUT_NODO", 15, 2, 3600);
+    g_max_conexiones = env_int("SMCD_MAX_CONEXIONES", 200, 1, 5000);
 
-    /* Evita que el proceso muera si un cliente cierra la conexión abruptamente
-     * mientras el servidor intenta escribirle (control de excepciones, req. 11) */
     signal(SIGPIPE, SIG_IGN);
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = al_recibir_senal;          /* sin SA_RESTART: interrumpe accept/select */
+    sigaction(SIGINT, &sa, NULL);
+    sigaction(SIGTERM, &sa, NULL);
 
-    /* --- Socket TCP --- */
+    /* --- socket TCP --- */
     int tcp_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (tcp_fd < 0) { perror("socket TCP"); return 1; }
     int opt = 1;
     setsockopt(tcp_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    addr.sin_port = htons((uint16_t) puerto);
+    if (bind(tcp_fd, (struct sockaddr *) &addr, sizeof(addr)) < 0) { perror("bind TCP"); return 1; }
+    if (listen(tcp_fd, 128) < 0) { perror("listen"); return 1; }
 
-    struct sockaddr_in tcp_addr;
-    memset(&tcp_addr, 0, sizeof(tcp_addr));
-    tcp_addr.sin_family = AF_INET;
-    tcp_addr.sin_addr.s_addr = INADDR_ANY;
-    tcp_addr.sin_port = htons(puerto);
-
-    if (bind(tcp_fd, (struct sockaddr *) &tcp_addr, sizeof(tcp_addr)) < 0) {
-        perror("bind TCP");
-        return 1;
-    }
-    if (listen(tcp_fd, 10) < 0) {
-        perror("listen");
-        return 1;
-    }
-
-    /* --- Socket UDP (mismo número de puerto, socket distinto) --- */
+    /* --- socket UDP (mismo numero de puerto; los espacios de puertos son independientes) --- */
     int udp_fd = socket(AF_INET, SOCK_DGRAM, 0);
-    struct sockaddr_in udp_addr;
-    memset(&udp_addr, 0, sizeof(udp_addr));
-    udp_addr.sin_family = AF_INET;
-    udp_addr.sin_addr.s_addr = INADDR_ANY;
-    udp_addr.sin_port = htons(puerto);
+    if (udp_fd < 0) { perror("socket UDP"); return 1; }
+    struct timeval t1 = { 1, 0 };
+    setsockopt(udp_fd, SOL_SOCKET, SO_RCVTIMEO, &t1, sizeof(t1));
+    if (bind(udp_fd, (struct sockaddr *) &addr, sizeof(addr)) < 0) { perror("bind UDP"); return 1; }
 
-    if (bind(udp_fd, (struct sockaddr *) &udp_addr, sizeof(udp_addr)) < 0) {
-        perror("bind UDP");
-        return 1;
-    }
+    log_evento("INFO", "0.0.0.0", (int) puerto,
+               "Servidor SMCD iniciado en el puerto %ld (TCP y UDP). Timeout de nodos: %d s. Max conexiones: %d",
+               puerto, g_timeout_nodo, g_max_conexiones);
 
-    char detalle[128];
-    snprintf(detalle, sizeof(detalle), "Servidor SMCD escuchando en el puerto %d (TCP y UDP)", puerto);
-    log_evento("INFO", "0.0.0.0", puerto, detalle);
+    pthread_t th_udp, th_mon;
+    pthread_create(&th_udp, NULL, hilo_udp, &udp_fd);
+    pthread_create(&th_mon, NULL, hilo_monitor, NULL);
 
-    int clientes[MAX_CLIENTES_TCP];
-    for (int i = 0; i < MAX_CLIENTES_TCP; i++) clientes[i] = -1;
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+    pthread_attr_setstacksize(&attr, STACK_HILO);
 
-    while (1) {
-        fd_set readfds;
-        FD_ZERO(&readfds);
-        FD_SET(tcp_fd, &readfds);
-        FD_SET(udp_fd, &readfds);
-        int maxfd = (tcp_fd > udp_fd) ? tcp_fd : udp_fd;
+    /* --- bucle principal: aceptar conexiones y delegarlas a un hilo cada una --- */
+    while (g_running) {
+        fd_set rfds;
+        FD_ZERO(&rfds);
+        FD_SET(tcp_fd, &rfds);
+        struct timeval espera = { 1, 0 };       /* para revisar g_running cada segundo */
+        int r = select(tcp_fd + 1, &rfds, NULL, NULL, &espera);
+        if (r < 0) { if (errno == EINTR) continue; perror("select"); break; }
+        if (r == 0) continue;
 
-        for (int i = 0; i < MAX_CLIENTES_TCP; i++) {
-            if (clientes[i] >= 0) {
-                FD_SET(clientes[i], &readfds);
-                if (clientes[i] > maxfd) maxfd = clientes[i];
-            }
+        struct sockaddr_in cli;
+        socklen_t cl = sizeof(cli);
+        int fd = accept(tcp_fd, (struct sockaddr *) &cli, &cl);
+        if (fd < 0) {
+            if (errno == EINTR || errno == EAGAIN || errno == ECONNABORTED) continue;
+            log_evento("ERROR", "-", 0, "accept fallo: %s", strerror(errno));
+            usleep(100000);
+            continue;
         }
 
-        int activity = select(maxfd + 1, &readfds, NULL, NULL, NULL);
-        if (activity < 0) {
-            if (errno == EINTR) continue;
-            perror("select");
-            break;
+        conn_t *c = malloc(sizeof(*c));
+        if (!c) { close(fd); continue; }
+        c->fd = fd;
+        inet_ntop(AF_INET, &cli.sin_addr, c->ip, sizeof(c->ip));
+        c->puerto = ntohs(cli.sin_port);
+
+        pthread_mutex_lock(&g_conn_mtx);
+        int lleno = (g_conexiones >= g_max_conexiones);
+        if (!lleno) g_conexiones++;
+        pthread_mutex_unlock(&g_conn_mtx);
+
+        if (lleno) {
+            log_evento("WARNING", c->ip, c->puerto, "Conexion rechazada: limite de %d conexiones", g_max_conexiones);
+            nmp_send(fd, TYPE_ERROR, 0, "servidor", "codigo=SERVIDOR_OCUPADO;detalle=limite_de_conexiones");
+            close(fd);
+            free(c);
+            continue;
         }
-
-        /* Nueva conexión TCP entrante */
-        if (FD_ISSET(tcp_fd, &readfds)) {
-            struct sockaddr_in cli_addr;
-            socklen_t cli_len = sizeof(cli_addr);
-            int new_fd = accept(tcp_fd, (struct sockaddr *) &cli_addr, &cli_len);
-
-            if (new_fd >= 0) {
-                int slot = -1;
-                for (int i = 0; i < MAX_CLIENTES_TCP; i++) {
-                    if (clientes[i] < 0) { slot = i; break; }
-                }
-                if (slot == -1) {
-                    close(new_fd); /* sin espacio disponible por ahora */
-                } else {
-                    clientes[slot] = new_fd;
-                    char ip[INET_ADDRSTRLEN];
-                    inet_ntop(AF_INET, &cli_addr.sin_addr, ip, sizeof(ip));
-                    log_evento("INFO", ip, ntohs(cli_addr.sin_port), "Nueva conexion TCP aceptada");
-                }
-            }
-        }
-
-        /* Datagrama UDP entrante (telemetría) */
-        if (FD_ISSET(udp_fd, &readfds)) {
-            char buffer[2048];
-            struct sockaddr_in remitente;
-            socklen_t remitente_len = sizeof(remitente);
-            int n = recvfrom(udp_fd, buffer, sizeof(buffer) - 1, 0,
-                              (struct sockaddr *) &remitente, &remitente_len);
-            if (n > 0) {
-                buffer[n] = '\0';
-                char ip[INET_ADDRSTRLEN];
-                inet_ntop(AF_INET, &remitente.sin_addr, ip, sizeof(ip));
-                int puerto_remitente = ntohs(remitente.sin_port);
-
-                nmp_message_t msg;
-                if (nmp_parse_buffer(buffer, n, &msg) == 0 && msg.type == TYPE_TELEMETRY) {
-                    manejar_telemetria_udp(ip, puerto_remitente, &msg);
-                } else {
-                    log_evento("ERROR", ip, puerto_remitente, "Datagrama UDP con formato invalido");
-                }
-            }
-        }
-
-        /* Mensajes de clientes TCP ya conectados */
-        for (int i = 0; i < MAX_CLIENTES_TCP; i++) {
-            if (clientes[i] >= 0 && FD_ISSET(clientes[i], &readfds)) {
-                struct sockaddr_in cli_addr;
-                socklen_t cli_len = sizeof(cli_addr);
-                getpeername(clientes[i], (struct sockaddr *) &cli_addr, &cli_len);
-                char ip[INET_ADDRSTRLEN];
-                inet_ntop(AF_INET, &cli_addr.sin_addr, ip, sizeof(ip));
-                int puerto_cli = ntohs(cli_addr.sin_port);
-
-                nmp_message_t msg;
-                if (nmp_recv(clientes[i], &msg) < 0) {
-                    log_evento("INFO", ip, puerto_cli, "Conexion TCP cerrada");
-                    close(clientes[i]);
-                    clientes[i] = -1;
-                } else {
-                    manejar_mensaje_tcp(clientes[i], ip, puerto_cli, &msg);
-                }
-            }
+        pthread_t th;
+        if (pthread_create(&th, &attr, hilo_conexion, c) != 0) {
+            log_evento("ERROR", c->ip, c->puerto, "No se pudo crear el hilo de la conexion");
+            pthread_mutex_lock(&g_conn_mtx);
+            g_conexiones--;
+            pthread_mutex_unlock(&g_conn_mtx);
+            close(fd);
+            free(c);
         }
     }
 
-    fclose(log_file);
+    log_evento("INFO", "0.0.0.0", (int) puerto, "Senal de parada recibida: cerrando el servidor");
+    g_running = 0;
+    pthread_join(th_udp, NULL);
+    pthread_join(th_mon, NULL);
     close(tcp_fd);
     close(udp_fd);
+    log_evento("INFO", "0.0.0.0", (int) puerto, "Servidor detenido");
+    log_cerrar();
     return 0;
 }

@@ -1,0 +1,23 @@
+# Usuarios de prueba para el sistema SMCD
+# Árbol:  dc=smcd,dc=local  ->  ou=people  ->  uid=<usuario>
+# El PERFIL del usuario (admin / viewer) se guarda en el atributo employeeType.
+
+dn: ou=people,dc=smcd,dc=local
+objectClass: organizationalUnit
+ou: people
+
+dn: uid=admin1,ou=people,dc=smcd,dc=local
+objectClass: inetOrgPerson
+uid: admin1
+cn: Administrador Uno
+sn: Uno
+employeeType: admin
+userPassword: admin123
+
+dn: uid=viewer1,ou=people,dc=smcd,dc=local
+objectClass: inetOrgPerson
+uid: viewer1
+cn: Observador Uno
+sn: Uno
+employeeType: viewer
+userPassword: viewer123
